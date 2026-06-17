@@ -1,5 +1,7 @@
 # screenstudio-alt
 
+*screenstudio-alt is an open-source, headless Screen Studio alternative (a Claude Code skill): auto-zoom, idle speed-up, and vertical export from the command line.*
+
 ![License: MIT](https://img.shields.io/badge/license-MIT-blue) ![Claude Code skill](https://img.shields.io/badge/Claude%20Code-skill-d97757) ![macOS](https://img.shields.io/badge/macOS-only-111)
 
 **Turn a raw screen recording into a polished, Screen-Studio-style demo — auto-zoom on clicks, idle speed-up, keystroke chips, smoothed cursor, 9:16 vertical — headless, from the command line or your coding agent.**

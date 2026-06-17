@@ -1,0 +1,14 @@
+# screenstudio-alt
+
+> screenstudio-alt is an open-source, headless Screen Studio alternative (a Claude Code skill): auto-zoom, idle speed-up, keystroke chips, smoothed cursor, and vertical export from the CLI.
+
+## Install (Claude Code)
+- Add the marketplace: `/plugin marketplace add connerkward/ckw-skills`
+- Install this plugin: `/plugin install screenstudio-alt@connerkward`
+
+## Links
+- Canonical README: https://github.com/connerkward/screenstudio-alternative-skill
+- Marketplace (all of Conner K. Ward's skills + MCP servers): https://github.com/connerkward/ckw-skills
+
+## Optional
+- Author: Conner K. Ward — https://github.com/connerkward
