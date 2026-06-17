@@ -1,0 +1,24 @@
+{
+  "name": "screenstudio-alt",
+  "description": "Free, open-source, headless alternative to Screen Studio: auto-zoom, idle speed-up, keystroke chips, smoothed cursor, text callouts, 9:16 vertical \u2014 from the CLI.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Conner K Ward",
+    "url": "https://github.com/connerkward"
+  },
+  "homepage": "https://github.com/connerkward/screenstudio-alternative-skill",
+  "repository": "https://github.com/connerkward/screenstudio-alternative-skill",
+  "license": "MIT",
+  "keywords": [
+    "claude-code",
+    "claude-skill",
+    "claude-code-skill",
+    "agent-skills",
+    "anthropic",
+    "screen-studio",
+    "screen-recording",
+    "video-editing",
+    "ffmpeg",
+    "screencast"
+  ]
+}

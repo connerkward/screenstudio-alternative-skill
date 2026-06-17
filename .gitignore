@@ -1,0 +1,8 @@
+events-log
+fixture*.mp4
+fixture*.jsonl
+__pycache__/
+.DS_Store
+*.polished.*
+.studio-out/
+.playwright-mcp/
