@@ -74,3 +74,7 @@ python3 src/polish.py demo.mov --events demo.events.jsonl --speedup --zoom --key
 ## License
 
 MIT © Conner K Ward
+
+---
+
+🧭 **[ckw-skills](https://github.com/connerkward/ckw-skills)** — part of Conner K. Ward's collection of Claude Code skills & MCP servers.
