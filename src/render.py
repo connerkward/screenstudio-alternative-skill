@@ -12,8 +12,9 @@ Pipeline (one decode, one encode):
                                  → eased camera (z, cx, cy) → crop → LANCZOS → target
                                  → fixed-size synthetic cursor → encode @ fps
 
-Camera: cosine ease-in/out per zoom region (smooth, predictable). Crisp supersampled
-cursor, Screen-Studio-style click ripples + click sounds, per-segment idle speed-up.
+Camera: smootherstep ease-in/out per zoom region AND per pan (full ease, no linear
+middle — velocity ~0 at both ends, peaks mid-move). Curve selectable (smooth/snappy/
+linear). Crisp supersampled cursor, Screen-Studio click ripples + sounds, idle speed-up.
 
 Usage:
   render.py SRC.mp4 --regions regions.json --out OUT.mp4 --aspect 16:9|1:1|9:16
@@ -144,24 +145,76 @@ def time_maps(segs):
     return o2s, s2o, out
 
 # ---- eased camera trajectory ------------------------------------------------
-def ease_traj(regions, key, rest, fps, dur, ramp=0.5):
-    """Cosine ease-in/out per region → per-frame array. Smooth, predictable zoom
-    (no overshoot). Each region eases rest→value over `ramp`, holds, eases back."""
+def ease_curve(a, curve="smooth"):
+    """Map normalized progress a∈[0,1] → eased 0..1. Full ease-in-out — velocity ~0
+    at BOTH ends, peaks mid-move (no constant-velocity middle). KEEP IN SYNC with
+    studio.py easeCurve().
+      smooth  → smootherstep 6a^5−15a^4+10a^3 (default; cinematic slow-start/stop)
+      snappy  → smootherstep then smoothstep on top → steeper midslope (faster snap)
+      linear  → a (constant velocity — the old mechanical feel, for comparison)"""
+    if a <= 0: return 0.0
+    if a >= 1: return 1.0
+    if curve == "linear":
+        return a
+    s = a * a * a * (a * (a * 6 - 15) + 10)    # smootherstep
+    if curve == "snappy":
+        # spend less time ramping: square the eased value's complement to sharpen the
+        # acceleration/deceleration so the move "snaps" into place faster, still 0-vel ends
+        s = s * s * (3 - 2 * s)                 # apply smoothstep on top → steeper midslope
+    return s
+
+_PAN_WARP = 0.65
+def ease_pan(a):
+    """Human-camera-operator pan easing for cx/cy translation (NOT zoom). Asymmetric,
+    ease-OUT-dominant: a quick pickup off the start, an EARLY velocity peak (~a=0.27),
+    then a long gentle deceleration that softly settles into the final framing — like a
+    real operator who gets the head moving then rides it down to a stop. Velocity is
+    exactly 0 at BOTH ends (no hard start/stop, no overshoot bounce).
+
+    Construction: smootherstep (which has 0 velocity AND 0 acceleration at both ends)
+    evaluated on a front-loaded input warp a**0.65. The warp compresses the early portion
+    of progress so the velocity peak lands at ~27% and ~90% of the travel is done by ~65%
+    of the time, leaving a long settle tail. Composing smootherstep with the warp preserves
+    the zero-velocity ends. KEEP IN SYNC with studio.py easePan()."""
+    if a <= 0: return 0.0
+    if a >= 1: return 1.0
+    w = a ** _PAN_WARP
+    return w * w * w * (w * (w * 6 - 15) + 10)    # smootherstep(a**0.65)
+
+def ease_traj(regions, key, rest, fps, dur, ramp=0.5, curve="smooth"):
+    """Per-region eased trajectory → per-frame array. FULL ease-in-out (smootherstep
+    by default) on every move — zoom rest→v, the in-region PAN v→v1, and v1→rest —
+    so velocity is ~0 at both ends and peaks in the middle (no linear middle).
+      ramp  : seconds of ease for the zoom-in / zoom-out at a region's edges.
+      curve : 'smooth' (smootherstep, default) | 'snappy' | 'linear'.
+    A region with a pan target (key+'1') glides across its ENTIRE span with the same
+    eased curve — not just a held sub-span — so the pan reads cinematic, not mechanical.
+    KEEP IN SYNC with studio.py easeTraj()."""
     n = int(round(dur * fps)) + 1
     arr = [rest] * n
     for r in sorted(regions, key=lambda r: r["o0"]):
         o0, o1, v = r["o0"], r["o1"], r[key]
+        v1 = r.get(key + "1", v)               # optional in-region target → camera PANS v→v1
         rmp = min(ramp, (o1 - o0) / 2)
+        h0, h1 = o0 + rmp, o1 - rmp            # held span between the ease-in / ease-out
         for i in range(n):
             t = i / fps
             if t < o0 or t > o1: continue
-            if rmp > 0 and t < o0 + rmp:
-                a = (t - o0) / rmp; f = 0.5 - 0.5 * math.cos(math.pi * a)
+            if key != "z" and v1 != v:                              # PAN: one continuous glide across the WHOLE region (overlaps zoom in/out → no hard stop/beat)
+                a = (t - o0) / (o1 - o0) if o1 > o0 else 1.0
+                # cx/cy translation uses the human ease-out-dominant pan curve (early
+                # velocity peak, long gentle settle); z keeps its own ease (left as-is).
+                arr[i] = v + (v1 - v) * (a if curve == "linear" else ease_pan(a))
+            elif rmp > 0 and t < o0 + rmp:
+                a = (t - o0) / rmp
+                b = rest if key == "z" else v                        # z: zoom rest→v ; static cx/cy: hold
+                arr[i] = b + (v - b) * ease_curve(a, curve)
             elif rmp > 0 and t > o1 - rmp:
-                a = (o1 - t) / rmp; f = 0.5 - 0.5 * math.cos(math.pi * a)
+                a = (o1 - t) / rmp
+                b = rest if key == "z" else v1                       # z: zoom v1→rest
+                arr[i] = b + (v1 - b) * ease_curve(a, curve)
             else:
-                f = 1.0
-            arr[i] = rest + (v - rest) * f
+                arr[i] = v
     return arr
 
 # ---- text callouts (screen-fixed labels, background-aware, like keystroke chips) ----
@@ -194,9 +247,62 @@ def _callout_pos(anchor, W, H, Tw, Th, m):
 # ---- main render ------------------------------------------------------------
 ASPECTS = {"16:9": (1280, 720), "1:1": (1080, 1080), "9:16": (1080, 1920)}
 
+# ── agent-readable metadata: bake the key "full-zoom" moments into the video ──
+# An agent that can't watch video can read these to jump straight to a relevant
+# frame: `ffprobe -show_chapters <v>` for in-file chapters, or the richer
+# `<v>.moments.json` sidecar (timestamp + what the camera is framed on), then
+# `ffmpeg -ss <t> -i <v> -frames:v 1 frame.png` to grab + analyze that moment.
+def _build_moments(R, regions, *, Sw, Sh, fps, out_dur):
+    moms = [{"t": 0.0, "kind": "overview", "label": "start / overview", "z": 1.0}]
+    for i, r in enumerate(R):
+        t = round((r["o0"] + r["o1"]) / 2.0, 3)          # middle of the held zoom/pan = representative frame
+        lab = (regions[i].get("label") if i < len(regions) else None) or f"zoom {i + 1}"
+        is_pan = "cx1" in r or "cy1" in r
+        cx = (r["cx"] + r.get("cx1", r["cx"])) / 2.0     # for a pan, frame the midpoint
+        cy = (r["cy"] + r.get("cy1", r["cy"])) / 2.0
+        moms.append({"t": t, "kind": "pan" if is_pan else "zoom", "label": lab, "z": round(r["z"], 3),
+                     "cx": round(cx, 1), "cy": round(cy, 1),
+                     "cx_norm": round(cx / Sw, 4), "cy_norm": round(cy / Sh, 4),
+                     "in": round(r["o0"], 3), "out": round(r["o1"], 3)})
+    moms.sort(key=lambda m: m["t"])
+    for m in moms:
+        m["frame"] = int(round(m["t"] * fps))
+    return moms
+
+def _ffmeta_chapters(moments, out_dur):
+    lines = [";FFMETADATA1"]
+    ts = [m["t"] for m in moments] + [out_dur]
+    for i, m in enumerate(moments):
+        start = int(round(m["t"] * 1000)); end = int(round(min(ts[i + 1], out_dur) * 1000))
+        if end <= start: end = min(int(out_dur * 1000), start + 1500)
+        lines += ["[CHAPTER]", "TIMEBASE=1/1000", f"START={start}", f"END={end}",
+                  "title=" + str(m["label"]).replace("\n", " ")]
+    return "\n".join(lines) + "\n"
+
+def _bake_metadata(out_path, moments, *, src, fps, Sw, Sh, Tw, Th, out_dur):
+    side = out_path + ".moments.json"
+    json.dump({"video": os.path.basename(out_path), "source": os.path.basename(src),
+               "duration": round(out_dur, 3), "fps": fps, "w": Tw, "h": Th,
+               "source_w": Sw, "source_h": Sh,
+               "howto": "jump to moment.t (seconds) and grab a frame: "
+                        "ffmpeg -ss <t> -i <video> -frames:v 1 out.png  · in-file: ffprobe -show_chapters <video>",
+               "moments": moments}, open(side, "w"), indent=2)
+    meta = out_path + ".ffmeta.txt"; open(meta, "w").write(_ffmeta_chapters(moments, out_dur))
+    tmp = out_path + ".chap.mp4"
+    rc = subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", out_path, "-i", meta,
+                         "-map_metadata", "1", "-map_chapters", "1", "-codec", "copy", tmp]).returncode
+    if rc == 0 and os.path.exists(tmp): os.replace(tmp, out_path)
+    else:
+        try: os.remove(tmp)
+        except OSError: pass
+    try: os.remove(meta)
+    except OSError: pass
+    return side
+
 def render(src, regions, out_path, *, aspect="16:9", fit="cover", events=None, fps=60,
-           ramp=0.5, cursor=False, clickfx=False, segs=None,
-           bg="none", pad=0.06, radius=18, shadow=True, callouts=None, progress_file=None):
+           ramp=0.5, curve="smooth", cursor=False, clickfx=False, keys=False, segs=None,
+           bg="none", pad=0.06, radius=18, shadow=True, callouts=None, progress_file=None,
+           metadata=True):
     vid = polish.probe(src)
     Sw, Sh, sfps = vid["w"], vid["h"], vid["fps"]
     o2s, s2o, out_dur = time_maps(segs) if segs else (lambda t: t, lambda t: t, vid["dur"])
@@ -246,20 +352,28 @@ def render(src, regions, out_path, *, aspect="16:9", fit="cover", events=None, f
     R = []
     for r in regions:
         z = float(r.get("z", 2.0))
-        R.append({"o0": s2o(float(r["t0"])), "o1": s2o(float(r["t1"])), "z": z,
-                  "cx": float(r.get("cx", Sw / 2)), "cy": float(r.get("cy", Sh / 2))})
+        d = {"o0": s2o(float(r["t0"])), "o1": s2o(float(r["t1"])), "z": z,
+             "cx": float(r.get("cx", Sw / 2)), "cy": float(r.get("cy", Sh / 2))}
+        if "cx1" in r: d["cx1"] = float(r["cx1"])    # pan target → ease_traj glides cx/cy across the hold
+        if "cy1" in r: d["cy1"] = float(r["cy1"])
+        R.append(d)
 
     # eased camera trajectories over the output timeline
-    zt  = ease_traj(R, "z",  1.0,  fps, out_dur, ramp)
-    cxt = ease_traj(R, "cx", Sw/2, fps, out_dur, ramp)
-    cyt = ease_traj(R, "cy", Sh/2, fps, out_dur, ramp)
+    zt  = ease_traj(R, "z",  1.0,  fps, out_dur, ramp, curve)
+    cxt = ease_traj(R, "cx", Sw/2, fps, out_dur, ramp, curve)
+    cyt = ease_traj(R, "cy", Sh/2, fps, out_dur, ramp, curve)
     nframes = len(zt)
 
     cur_xs = cur_ys = None; clicks = []
-    if (cursor or clickfx) and events:
+    callouts = list(callouts or [])
+    if (cursor or clickfx or keys) and events:
         ev = polish.load_events(events, vid)
         if cursor: cur_xs, cur_ys = polish.smooth_positions(ev["moves"], sfps, vid["dur"])
         if clickfx: clicks = [(t, x, y) for t, x, y in ev["clicks"]]
+        if keys:   # keystroke caption = ONE bottom-center window per burst whose text grows
+            callouts += [{"t0": s2o(g["t0"]), "t1": s2o(g["t1"]), "anchor": "bottom", "size": 0.055,
+                          "steps": [(s2o(st), tx) for st, tx in g["steps"]]}
+                         for g in polish.key_caps(ev["keys"])]
     RIPPLE = 0.5   # seconds; soft expanding ring per click
 
     # if click sounds are needed, render video to a temp then mux audio
@@ -359,13 +473,21 @@ def render(src, regions, out_path, *, aspect="16:9", fit="cover", events=None, f
                     if not (c["t0"] <= ot <= c["t1"]): continue
                     fade = max(0.0, min(1.0, (ot - c["t0"]) / 0.3, (c["t1"] - ot) / 0.3))
                     if fade <= 0: continue
+                    if c.get("steps"):                       # keystroke caption: text accumulates within the window
+                        text = c["steps"][0][1]
+                        for st, tx in c["steps"]:
+                            if st <= ot: text = tx
+                            else: break
+                    else:
+                        text = c.get("text", "")
+                    if not text: continue
                     cpx = max(12, int(c.get("size", 0.036) * Th))
-                    W, H, font, bb, padx, pady = _callout_measure(c["text"], cpx)
+                    W, H, font, bb, padx, pady = _callout_measure(text, cpx)
                     cx0, cy0 = _callout_pos(c.get("anchor", "bottom"), W, H, Tw, Th, int(0.045*Th))
                     if fr is None: fr = np.asarray(img if img.mode == "RGB" else img.convert("RGB"))
                     sub = fr[cy0:cy0+H, cx0:cx0+W]
                     lum = float(sub.mean()) if sub.size else 128.0
-                    co = _callout_render(c["text"], lum, font, bb, padx, pady, W, H)
+                    co = _callout_render(text, lum, font, bb, padx, pady, W, H)
                     if fade < 1.0:
                         co.putalpha(co.split()[3].point(lambda v: int(v * fade)))
                     img.paste(co, (cx0, cy0), co)
@@ -409,7 +531,13 @@ def render(src, regions, out_path, *, aspect="16:9", fit="cover", events=None, f
         subprocess.run(["ffmpeg","-y","-v","error","-i",tmp_v,"-i",wav,"-c:v","copy",
                         "-c:a","aac","-b:a","160k","-shortest",out_path], check=True)
         os.remove(tmp_v); os.remove(wav)
-    return {"w": Tw, "h": Th, "fps": fps, "frames": nframes, "dur": round(out_dur,2)}
+    result = {"w": Tw, "h": Th, "fps": fps, "frames": nframes, "dur": round(out_dur, 2)}
+    if metadata:
+        moments = _build_moments(R, regions, Sw=Sw, Sh=Sh, fps=fps, out_dur=out_dur)
+        result["moments_file"] = _bake_metadata(out_path, moments, src=src, fps=fps,
+                                                Sw=Sw, Sh=Sh, Tw=Tw, Th=Th, out_dur=out_dur)
+        result["moments"] = moments
+    return result
 
 def build_segs(src, events, idle_speed):
     vid = polish.probe(src)
@@ -432,6 +560,24 @@ def build_speed_segs(dur, spans):
     if cur < dur: segs.append((cur, dur, 1.0))
     return segs
 
+def clip_segs_to_trim(segs, dur, trim_in, trim_out):
+    """Restrict a full-coverage seg list to the source window [trim_in, trim_out] so the
+    time-remap (time_maps) only spans the trimmed range — output 0 maps to trim_in and
+    out_dur reflects only the kept range. trim_out<=0 → source end. If segs is None we
+    synthesize a single 1× seg over the window so trim works without any speed-up."""
+    lo = max(0.0, float(trim_in or 0.0))
+    hi = float(trim_out) if (trim_out and trim_out > 0) else dur
+    hi = max(lo + 1e-3, min(hi, dur))
+    if lo <= 1e-6 and hi >= dur - 1e-6:
+        return segs                                   # no real trim → leave segs untouched
+    base = segs if segs else [(0.0, dur, 1.0)]
+    out = []
+    for s0, s1, sp in base:
+        a, b = max(s0, lo), min(s1, hi)
+        if b - a > 1e-6: out.append((a, b, sp))
+    if not out: out = [(lo, hi, 1.0)]
+    return out
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("src"); ap.add_argument("--regions", required=True); ap.add_argument("--out", required=True)
@@ -441,7 +587,10 @@ if __name__ == "__main__":
                          "sources); contain = fit whole source inside frame + letterbox/pad")
     ap.add_argument("--events")
     ap.add_argument("--fps", type=int, default=60); ap.add_argument("--ramp", type=float, default=0.5)
+    ap.add_argument("--curve", default="smooth", choices=["smooth", "snappy", "linear"],
+                    help="camera easing curve: smooth=smootherstep ease-in-out (default), snappy=steeper, linear=constant-velocity (mechanical)")
     ap.add_argument("--cursor", action="store_true"); ap.add_argument("--clickfx", action="store_true")
+    ap.add_argument("--keys", action="store_true", help="keystroke chips (auto bottom callouts; needs --events)")
     ap.add_argument("--speedup", action="store_true"); ap.add_argument("--idle-speed", type=float, default=8.0)
     ap.add_argument("--speed-segments")
     ap.add_argument("--bg", default="none", choices=["none", *BACKDROPS, "blur"],
@@ -452,6 +601,10 @@ if __name__ == "__main__":
     ap.add_argument("--radius", type=float, default=18); ap.add_argument("--no-shadow", action="store_true")
     ap.add_argument("--callouts", help="JSON [{t0,t1,text,anchor,size}] of screen-fixed text labels (OUTPUT time); anchor e.g. top-left/top/bottom-right/center")
     ap.add_argument("--progress-file")
+    ap.add_argument("--trim-in", type=float, default=0.0, help="source clip in-point (seconds); demo starts here")
+    ap.add_argument("--trim-out", type=float, default=0.0, help="source clip out-point (seconds; 0 = source end); demo ends here")
+    ap.add_argument("--no-metadata", action="store_true",
+                    help="skip baking agent-readable moment chapters + <out>.moments.json sidecar (on by default)")
     a = ap.parse_args()
     regions = json.load(open(a.regions)) if os.path.exists(a.regions) else json.loads(a.regions)
     callouts = (json.load(open(a.callouts)) if os.path.exists(a.callouts) else json.loads(a.callouts)) if a.callouts else None
@@ -462,7 +615,11 @@ if __name__ == "__main__":
         segs = build_segs(a.src, a.events, a.idle_speed)
     else:
         segs = None
+    if a.trim_in or a.trim_out:                       # restrict the time-remap to the trimmed source window
+        _dur = polish.probe(a.src)["dur"]
+        segs = clip_segs_to_trim(segs, _dur, a.trim_in, a.trim_out)
     r = render(a.src, regions, a.out, aspect=a.aspect, fit=a.fit, events=a.events, fps=a.fps,
-               ramp=a.ramp, cursor=a.cursor, clickfx=a.clickfx, segs=segs,
-               bg=a.bg, pad=a.pad, radius=a.radius, shadow=not a.no_shadow, callouts=callouts, progress_file=a.progress_file)
+               ramp=a.ramp, curve=a.curve, cursor=a.cursor, clickfx=a.clickfx, keys=a.keys, segs=segs,
+               bg=a.bg, pad=a.pad, radius=a.radius, shadow=not a.no_shadow, callouts=callouts, progress_file=a.progress_file,
+               metadata=not a.no_metadata)
     print(json.dumps(r))

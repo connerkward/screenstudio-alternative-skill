@@ -80,8 +80,16 @@ def cursor_at(moves, t):
     return (a[1]+(b[1]-a[1])*f, a[2]+(b[2]-a[2])*f)
 
 def load_events(path, vid):
-    """Parse events.jsonl; map display points -> video pixels."""
-    header, moves, clicks, keys = None, [], [], []
+    """Parse events.jsonl; map display points -> video pixels.
+
+    Element-aware zoom: a `down` (click) or `key` event may carry an optional
+    `bbox: [x,y,w,h]` — the focused/clicked element's getBoundingClientRect in
+    display POINTS. We scale it to video px and carry it alongside the click/key so
+    zoom_regions can frame the actual element (the search bar, the clicked image)
+    instead of just the cursor point. `click_bbox` is aligned 1:1 with `clicks`
+    (None where the click had no element); `key_bbox` is the element being typed into
+    (carried on the first key that has one), used for the typing-burst zoom."""
+    header, moves, clicks, click_bbox, keys, key_bbox = None, [], [], [], [], None
     with open(path) as f:
         for line in f:
             line = line.strip()
@@ -90,16 +98,24 @@ def load_events(path, vid):
             if e.get("type") == "header": header = e; continue
             t = e.get("t")
             if e.get("type") == "move":  moves.append((t, e["x"], e["y"]))
-            elif e.get("type") == "down": clicks.append((t, e["x"], e["y"]))
-            elif e.get("type") == "key":  keys.append((t, e["key"]))
+            elif e.get("type") == "down":
+                clicks.append((t, e["x"], e["y"]))
+                click_bbox.append(e.get("bbox"))
+            elif e.get("type") == "key":
+                keys.append((t, e["key"]))
+                if key_bbox is None and e.get("bbox"): key_bbox = e["bbox"]
     # event coords are display POINTS; header carries pointsW/H (real logger)
     # or just w/h (synthetic fixtures, where points == pixels)
     disp_w = header["display"].get("pointsW", header["display"]["w"]) if header else vid["w"]
     disp_h = header["display"].get("pointsH", header["display"]["h"]) if header else vid["h"]
     sx, sy = vid["w"]/disp_w, vid["h"]/disp_h
+    def scale_bbox(b):
+        return None if not b else [b[0]*sx, b[1]*sy, b[2]*sx, b[3]*sy]   # x,y,w,h in video px
     moves  = [(t, x*sx, y*sy) for t,x,y in moves]
     clicks = [(t, x*sx, y*sy) for t,x,y in clicks]
-    return {"moves":moves, "clicks":clicks, "keys":keys}
+    click_bbox = [scale_bbox(b) for b in click_bbox]
+    return {"moves":moves, "clicks":clicks, "click_bbox":click_bbox,
+            "keys":keys, "key_bbox":scale_bbox(key_bbox)}
 
 # ---------------------------------------------------------------- speedup
 def detect_freezes(path, noise=0.003, min_d=1.5):
@@ -220,36 +236,84 @@ def piecewise(kfs, T="t"):
         expr = f"if(lt({T},{t1:.4f}),{ease_expr(t0,t1,v0,v1,T)},{expr})"
     return f"if(lt({T},{kfs[0][0]:.4f}),{kfs[0][1]:.5f},{expr})"
 
+def bbox_zoom(bbox, vid, level, level_cap, pad=0.55):
+    """Frame an element bbox [x,y,w,h] (video px): return (z, cx, cy) so the camera's
+    viewport snugly contains the bbox plus `pad` fractional margin on each side. The
+    zoom is the largest z (most-zoomed) that still fits the padded bbox inside the
+    output-aspect viewport, clamped to [level, level_cap]. cx,cy = bbox center.
+    This is what makes the zoom ELEMENT-AWARE: it frames the search bar / clicked image
+    exactly, instead of an offset from the cursor point.
+
+    EDGE-AWARE FLOOR: the renderer clamps the camera center to keep the viewport on-screen
+    (cy ∈ [H/2z, H-H/2z]). For an element near an edge (e.g. a search bar near the page
+    TOP), too LOW a z makes the viewport so tall that this clamp shoves the frame DOWN —
+    off the element and onto whatever is below (the nav/gallery). To keep the element
+    actually centered we therefore raise z to at least the value at which its center is
+    reachable without clamping: z ≥ W/(2·min(cx,W-cx)) and z ≥ H/(2·min(cy,H-cy)). The
+    final z is max(that floor, the fit-z), clamped to [level, level_cap]."""
+    W, H = vid["w"], vid["h"]
+    bx, by, bw, bh = bbox
+    cx = bx + bw/2.0; cy = by + bh/2.0
+    # padded target extent the viewport must cover
+    tw = max(1.0, bw*(1+2*pad)); th = max(1.0, bh*(1+2*pad))
+    # z that fits the target on each axis (viewport = W/z × H/z); take the smaller z
+    # (the looser fit) so BOTH dimensions are contained.
+    z_fit = min(W/tw, H/th)
+    # edge floor: smallest z at which (cx,cy) is NOT pushed by the render-time center clamp
+    z_edge = max(W/(2*max(1.0, min(cx, W-cx))), H/(2*max(1.0, min(cy, H-cy))))
+    z = max(z_fit, z_edge)
+    return (round(max(level, min(z, level_cap)), 3), round(cx, 1), round(cy, 1))
+
 def zoom_regions(clicks, vid, level, dur, gap=2.5, pre=0.45, post=1.0, ramp=0.55,
-                 level_cap=2.6, keys=None, moves=None):
+                 level_cap=2.6, text_cap=6.5, keys=None, moves=None, click_bbox=None, key_bbox=None):
     """Auto-detect editable zoom regions → [{t0,t1,z,cx,cy}] (t0..t1 = zoom span in
     source time; cx,cy = center in video px). Two activity sources:
       • click clusters — span holds through any typing that follows the last click;
-      • standalone TYPING bursts (no nearby click) — activity-aware zoom centred on the
-        cursor position during the burst, so e.g. tabbing into a field and typing still
-        zooms. (Scroll/drag aren't in the event log, so they aren't covered.)
-    Edge-aware level: corner targets zoom harder so they can be centered."""
+      • standalone TYPING bursts (no nearby click) — activity-aware zoom on the typed
+        element / cursor.
+    ELEMENT-AWARE: when a click (click_bbox) or the typed field (key_bbox) carries the
+    focused element's bbox, the region is framed to that bbox exactly (bbox center +
+    a z that snugly contains it). Falls back to the cursor-point + edge-aware level
+    when no bbox is present. (Scroll/drag aren't in the event log, so they aren't
+    covered.) Edge-aware fallback: corner targets zoom harder so they can be centered."""
     W,H = vid["w"], vid["h"]
     key_t = sorted(t for t,_ in (keys or []))
+    click_bbox = click_bbox or []
     def edge_z(cx,cy):
         need = max(W/(2*max(1,min(cx,W-cx))), H/(2*max(1,min(cy,H-cy))))
         return round(max(level, min(need, level_cap)), 3)
     regs = []
     if clicks:
-        clusters, cur = [], [clicks[0]]
-        for c in clicks[1:]:
-            (cur.append(c) if c[0]-cur[-1][0] <= gap else (clusters.append(cur), cur := [c]))
+        # cluster clicks by time gap, keeping each click's index so we can look up its bbox
+        idx = list(range(len(clicks)))
+        clusters, cur = [], [idx[0]]
+        for i in idx[1:]:
+            (cur.append(i) if clicks[i][0]-clicks[cur[-1]][0] <= gap else (clusters.append(cur), cur := [i]))
         clusters.append(cur)
         last_end = 0.0
         for ci,cl in enumerate(clusters):
-            next_start = clusters[ci+1][0][0] if ci+1 < len(clusters) else dur
-            last_click = cl[-1][0]
+            cl_clicks = [clicks[i] for i in cl]
+            next_start = clusters[ci+1] and clicks[clusters[ci+1][0]][0] if ci+1 < len(clusters) else dur
+            if ci+1 >= len(clusters): next_start = dur
+            last_click = cl_clicks[-1][0]
             typed = [kt for kt in key_t if last_click-0.3 <= kt < next_start-0.3]
             hold_until = max([last_click] + typed)
-            cx = sum(c[1] for c in cl)/len(cl); cy = sum(c[2] for c in cl)/len(cl)
-            t0 = max(last_end+0.02, cl[0][0]-pre-ramp)
+            t0 = max(last_end+0.02, cl_clicks[0][0]-pre-ramp)
             t1 = min(dur-0.02, hold_until+post+ramp)
-            regs.append({"t0":round(t0,3),"t1":round(t1,3),"z":edge_z(cx,cy),"cx":round(cx,1),"cy":round(cy,1)})
+            # Prefer the element bbox of the LAST click in the cluster (the one the user
+            # acted on / typed into). If the cluster will hold through a typing burst and
+            # a key_bbox exists, that field bbox frames the typing better.
+            bbox = next((click_bbox[i] for i in reversed(cl) if i < len(click_bbox) and click_bbox[i]), None)
+            is_text = False
+            if typed and key_bbox: bbox = key_bbox; is_text = True   # framing the typed query text
+            if bbox:
+                # the typed-text bbox is small + near the top, so it needs a HIGHER cap to be
+                # zoomed large/legible AND kept centered (edge floor) without clamping down.
+                z, cx, cy = bbox_zoom(bbox, vid, level, text_cap if is_text else level_cap)
+            else:
+                cx = sum(c[1] for c in cl_clicks)/len(cl_clicks); cy = sum(c[2] for c in cl_clicks)/len(cl_clicks)
+                z = edge_z(cx, cy); cx = round(cx,1); cy = round(cy,1)
+            regs.append({"t0":round(t0,3),"t1":round(t1,3),"z":z,"cx":cx,"cy":cy})
             last_end = t1
     if moves and key_t:                                    # activity-aware typing-burst zooms
         bursts, b = [], [key_t[0]]
@@ -259,12 +323,15 @@ def zoom_regions(clicks, vid, level, dur, gap=2.5, pre=0.45, post=1.0, ramp=0.55
         for bb in bursts:
             bs, be = bb[0], bb[-1]
             if be-bs < 0.4 and len(bb) < 3: continue        # ignore a stray keypress
-            cxcy = cursor_at(moves, bs)
-            if not cxcy: continue
             t0 = max(0.02, bs-pre-ramp); t1 = min(dur-0.02, be+post+ramp)
             if any(t0 < r["t1"] and t1 > r["t0"] for r in regs): continue  # already covered by a click cluster
-            regs.append({"t0":round(t0,3),"t1":round(t1,3),"z":edge_z(*cxcy),
-                         "cx":round(cxcy[0],1),"cy":round(cxcy[1],1)})
+            if key_bbox:
+                z, cx, cy = bbox_zoom(key_bbox, vid, level, text_cap)   # typed-text: higher cap
+            else:
+                cxcy = cursor_at(moves, bs)
+                if not cxcy: continue
+                z = edge_z(*cxcy); cx = round(cxcy[0],1); cy = round(cxcy[1],1)
+            regs.append({"t0":round(t0,3),"t1":round(t1,3),"z":z,"cx":cx,"cy":cy})
         regs.sort(key=lambda r: r["t0"])
     return regs
 
@@ -287,7 +354,11 @@ def keyframes_from_regions(regions, vid):
 
 def zoom_keyframes(clicks, vid, level, dur, **kw):
     keys = kw.pop("keys", None)
-    regs = zoom_regions(clicks, vid, level, dur, keys=keys, **kw)
+    click_bbox = kw.pop("click_bbox", None)
+    key_bbox = kw.pop("key_bbox", None)
+    moves = kw.pop("moves", None)
+    regs = zoom_regions(clicks, vid, level, dur, keys=keys, moves=moves,
+                        click_bbox=click_bbox, key_bbox=key_bbox, **kw)
     return keyframes_from_regions(regs, vid) if regs else None
 
 def zoom_filter(kfs, vid):
@@ -329,24 +400,34 @@ def vertical_filter(kfs, vid, out_w=1080, out_h=1920):
             f"d=1:s={out_w}x{out_h}:fps={fps}")
 
 # ---------------------------------------------------------------- keys
-def key_chips(keys, gap=0.9, hold=1.4, maxlen=24, max_chips=80):
-    """Accumulating chips: each keystroke extends the visible text (like real
-    typing), a >gap pause or maxlen starts a fresh chip. Returns
-    [(t0, t1, text)] where each entry shows `text` from t0 until t1."""
+def key_caps(keys, gap=0.9, hold=1.4, maxlen=24):
+    """One caption window per typing burst, WITH per-keystroke accumulation steps.
+    A >gap pause or `maxlen` chars starts a fresh window. Returns
+    [{t0, t1, text, steps}] where steps=[(t, text), …] is the text as it grows
+    keystroke by keystroke. The window is a SINGLE span [t0,t1] (one fade in, one
+    fade out); the text accumulates within it — a single expanding caption, not a
+    chip per key. (Per-keystroke chips each fading in/out is what made it look like
+    flickering "multiple windows"; per-group static text made it pop choppily. This
+    gives the good behavior: one window that grows char by char.)
+    Spans are clamped to never overlap, so at most one window is ever active."""
     if not keys: return []
     groups, cur = [], [keys[0]]
     for t,k in keys[1:]:
         if t-cur[-1][0] <= gap and len(cur) < maxlen: cur.append((t,k))
         else: groups.append(cur); cur = [(t,k)]
     groups.append(cur)
-    chips = []
-    for g in groups:
-        for i,(t,_) in enumerate(g):
-            t_next = g[i+1][0] if i+1 < len(g) else t+hold
-            chips.append((t, t_next, "".join(k for _,k in g[:i+1])))
-    if len(chips) > max_chips:   # typing-heavy clip: fall back to per-group chips
-        chips = [(g[0][0], g[-1][0]+hold, "".join(k for _,k in g)) for g in groups]
-    return chips
+    out = []
+    for i,g in enumerate(groups):
+        t1 = g[-1][0] + hold
+        if i+1 < len(groups): t1 = min(t1, groups[i+1][0][0])   # never overlap the next window
+        steps = [(g[j][0], "".join(k for _,k in g[:j+1])) for j in range(len(g))]
+        out.append({"t0": g[0][0], "t1": t1, "text": steps[-1][1], "steps": steps})
+    return out
+
+def key_chips(keys, gap=0.9, hold=1.4, maxlen=24):
+    """Per-burst windows as (t0, t1, text) tuples (final text) — for the timeline
+    track and the legacy HUD path. Drawing uses key_caps for the growing caption."""
+    return [(c["t0"], c["t1"], c["text"]) for c in key_caps(keys, gap, hold, maxlen)]
 
 def render_chips(chips, vid, tmp):
     """Render each chip as a PNG (PIL) — no drawtext/libfreetype dependency.
@@ -503,7 +584,8 @@ def main():
     # ---- horizontal: zoom (pass C) then chip HUD --------------------------
     kfs = None
     if (a.zoom or a.vertical) and ev:
-        kfs = zoom_keyframes(ev["clicks"], vid, a.zoom_level, vid["dur"], keys=ev["keys"])
+        kfs = zoom_keyframes(ev["clicks"], vid, a.zoom_level, vid["dur"], keys=ev["keys"],
+                             moves=ev["moves"], click_bbox=ev.get("click_bbox"), key_bbox=ev.get("key_bbox"))
         if kfs: print(f"[zoom] {sum(1 for i in range(1,len(kfs['z'])) if kfs['z'][i][1]>1.0 and kfs['z'][i-1][1]<=1.0)} zoom-ins")
     h_stage = base
     if a.zoom and kfs:

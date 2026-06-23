@@ -153,3 +153,40 @@ and idle spans, plus a ground-truth `events.jsonl` — every feature is validate
 python3 test/make-fixture.py test/fixture.mp4 test/fixture.events.jsonl
 python3 src/polish.py test/fixture.mp4 --events test/fixture.events.jsonl --speedup --zoom --keys --vertical
 ```
+
+## Recording the demo — deterministic frame-stepping
+
+`test/record-demo.js` records the studio NLE demo (the `studio.py` preview) to a smooth
+mp4/gif. It does **not** use Playwright's `recordVideo`.
+
+**Mechanism.** It drives the live studio page headless and *steps the logical timeline
+frame by frame*. For each output frame `i` it sets `v.currentTime = O2S(i/fps, speedMap())`
+(the studio's own output-time → source-time map), waits for the video `seeked` event plus
+2 `requestAnimationFrame`s so `tick()` repaints, then screenshots. Assemble the JPGs at the
+same fps and you get perfect constant-frame-rate output.
+
+**Why, not `recordVideo`.** `recordVideo` captures at the browser's `requestAnimationFrame`
+cadence — a variable frame rate with timing jitter. Forcing that VFR stream into a CFR
+mp4/gif duplicates and drops frames *unevenly*, most visible as a stutter/"skip" during fast
+motion (the auto-zoom) — literally a frozen frame wedged mid-motion. Frame-stepping captures
+each output frame exactly once → zero dropped/duplicated frames, smooth motion, clean loop.
+Measured on the delivered file: 0 frozen-mid-motion frames across all zoom bands; loop-seam
+first-vs-last diff ~0.5.
+
+It must run against the **live** studio page — it calls the studio's own `O2S`/`speedMap`
+time functions. It is slower than real-time and has no audio.
+
+```bash
+node test/record-demo.js <studio-url> [out-dir=/tmp/ssa-frames] [fps=30]
+# then assemble (pick <N> to end on the post-typing wide shot so it loops cleanly):
+ffmpeg -framerate 30 -i <out-dir>/f%05d.jpg -frames:v <N> \
+  -vf scale=1440:900 -c:v libx264 -pix_fmt yuv420p -crf 18 -movflags +faststart demo.mp4
+```
+
+**Contrast — this is not `recordVideo` and not `sck-record`.** Frame-stepping only works
+because the studio exposes a *seekable logical timeline* with its own clock. `recordVideo`
+and `sck-record` ([macos-screen-recorder](https://github.com/connerkward/macos-screen-recorder-system-audio)) are both real-time/VFR captures of a moving
+target — `recordVideo` of the browser's RAF cadence, `sck-record` of the macOS compositor
+via ScreenCaptureKit — and neither can be frame-stepped: there is no app logical clock to
+seek. They solve a different problem (real-time screen + system-audio capture) and are not
+replacements for this recorder, nor it for them.

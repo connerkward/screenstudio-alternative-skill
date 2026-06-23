@@ -71,10 +71,22 @@ def draw_frame(t):
                         fill=(70,120,220) if not pressed else (40,80,170))
     d.text((BTN[0]-18,BTN[1]-13),"Run",font=f_ui,fill="white")
     d.polygon([(BTN[0]-42,BTN[1]-8),(BTN[0]-42,BTN[1]+8),(BTN[0]-30,BTN[1])],fill="white")  # play tri
-    # panel (target 2) with typed text
+    # panel (target 2) — a focused search field. The typed keys are shown by the
+    # KEYSTROKE CAPTION overlay, NOT echoed here, so the caption isn't duplicated by
+    # on-screen text (keystroke captions are for keys that don't appear on screen).
+    typing = 12.0 <= t < 16.2
+    txt = typed_at(t)                                  # the growing "hello demo!" string
     d.rounded_rectangle([PANEL[0]-200,PANEL[1]-60,PANEL[0]+200,PANEL[1]+60],12,
-                        fill="white",outline=(180,180,190),width=2)
-    d.text((PANEL[0]-185,PANEL[1]-16),typed_at(t)+("|" if 12.0<=t<16.2 else ""),font=f_body,fill=(30,30,40))
+                        fill="white",outline=(90,150,230) if typing else (180,180,190),width=3 if typing else 2)
+    tx0 = PANEL[0]-185
+    if typing or txt:                                  # echo the typed text ON SCREEN, growing
+        d.text((tx0,PANEL[1]-16),txt,font=f_body,fill=(30,30,40))
+        if typing and int(t*2)%2==0:                   # blinking caret drawn as a SEPARATE bar
+            cw = d.textbbox((0,0),txt,font=f_body)[2]   # (never merges into the text as a letter)
+            cx = tx0 + cw + 3
+            d.line([(cx,PANEL[1]-18),(cx,PANEL[1]+18)],fill=(30,30,40),width=2)
+    else:
+        d.text((tx0,PANEL[1]-16),"Search…",font=f_body,fill=(170,170,180))
     # cursor
     # No baked cursor — the pipeline draws a crisp synthetic cursor from the event log
     # (matches the real `sck-record --no-cursor` capture workflow).
@@ -87,7 +99,7 @@ def main():
         draw_frame(i/FPS).save(f"{tmp}/f{i:05d}.png")
         if i % 120 == 0: print(f"  frames {i}/{n}", file=sys.stderr)
     subprocess.run(["ffmpeg","-y","-loglevel","error","-framerate",str(FPS),
-        "-i",f"{tmp}/f%05d.png","-c:v","libx264","-pix_fmt","yuv420p","-crf","18",OUT_MP4],check=True)
+        "-i",f"{tmp}/f%05d.png","-c:v","libx264","-pix_fmt","yuv420p","-crf","18","-movflags","+faststart",OUT_MP4],check=True)
     for p in os.listdir(tmp): os.remove(os.path.join(tmp,p))
     os.rmdir(tmp)
 

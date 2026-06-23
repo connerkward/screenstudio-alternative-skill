@@ -1,6 +1,6 @@
-# screenstudio-alt
+<h1><img src="docs/logo.svg" width="30" align="top" alt=""> screenstudio-alt</h1>
 
-*screenstudio-alt is an open-source, headless Screen Studio alternative (a Claude Code skill): auto-zoom, idle speed-up, and vertical export from the command line.*
+*screenstudio-alt is an open-source, headless Screen Studio alternative (a Claude Code skill): auto-zoom, idle speed-up, keystroke chips, smoothed cursor, text callouts, and 9:16 vertical export — from the command line.*
 
 ![License: MIT](https://img.shields.io/badge/license-MIT-blue) ![Claude Code skill](https://img.shields.io/badge/Claude%20Code-skill-d97757) ![macOS](https://img.shields.io/badge/macOS-only-111)
 
